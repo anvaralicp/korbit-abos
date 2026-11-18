@@ -1,0 +1,898 @@
+// ============================================================================
+// KORBIT ABOS (Autonomous Business Operating System) — Version 1.0 MVP Schema
+// Target Stack: Next.js App Router + TypeScript + Prisma ORM + PostgreSQL
+// Covers all 6 V1.0 MVP Modules:
+//   1. Tenant Registration, Tiered Pricing, Razorpay/Stripe Billing & 5-Zone Setup
+//   2. Dynamic Layer Detection (DLD) Hierarchy & Admin-Only Client Data Lock
+//   3. Product Master (HSN/SAC, GST), Client Intake & 6-Stage Pipeline + PDF Proposals
+//   4. Dual-Gate Discount Escalation Engine (4h-48h SLAs) & Commercial KYC Handoff
+//   5. Field Attendance, 3-Point GPS Check-In, Travel Allowance & Resignation Freeze
+//   6. AI Voice-to-CRM Structured Remark Extraction & Immutable Audit Ledger
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum PlanTier {
+  BASIC       // 1-20 employees   @ ₹299/user/mo
+  ADVANCED    // 21-100 employees @ ₹599/user/mo
+  PREMIUM     // 101-500 employees @ ₹999/user/mo
+  ENTERPRISE  // 500+ employees   @ Custom
+}
+
+enum BillingCycle {
+  MONTHLY
+  ANNUAL      // 10% savings
+}
+
+enum SubscriptionStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+}
+
+enum DepartmentType {
+  ADMIN
+  SALES
+  HR
+  COMMERCIAL
+}
+
+enum RoleLevel {
+  LAYER_01_ADMIN
+  LAYER_02_DEPT_HEAD
+  LAYER_03_ZONE_MANAGER
+  LAYER_04_REGION_MANAGER
+  LAYER_05_CITY_MANAGER
+  LAYER_06_EXECUTIVE
+  LAYER_N_SUBORDINATE
+}
+
+enum ZoneCode {
+  NORTH
+  SOUTH
+  EAST
+  WEST
+  NORTHEAST
+}
+
+enum ProductUnit {
+  UNIT
+  KG
+  HOUR
+  MONTH
+}
+
+enum TargetPeriod {
+  YEARLY
+  HALF_YEARLY
+  QUARTERLY
+}
+
+enum LeadSource {
+  COLD_CALL
+  REFERENCE
+  MARKETING
+}
+
+enum CallNature {
+  COLD
+  WARM
+  HOT
+}
+
+enum PipelineStage {
+  STAGE_1_LEAD_GEN
+  STAGE_2_INTRODUCTORY
+  STAGE_3_MEETING
+  STAGE_4_PROPOSAL
+  STAGE_5_NEGOTIATION
+  STAGE_6_CLOSED_WON
+  CLOSED_LOST
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  ESCALATED
+  DENIED
+}
+
+enum CorrectionActionType {
+  UPDATE_CLIENT
+  DELETE_CLIENT
+  REASSIGN_OWNER
+}
+
+enum CorrectionStatus {
+  PENDING_ADMIN
+  APPROVED
+  REJECTED
+}
+
+enum LeaveStatus {
+  PENDING_SENIOR
+  APPROVED
+  REJECTED
+}
+
+enum VehicleType {
+  TWO_WHEELER
+  FOUR_WHEELER
+  PUBLIC_TRANSIT
+}
+
+// ----------------------------------------------------------------------------
+// 1. TENANT, SUBSCRIPTION BILLING & GEOGRAPHIC HIERARCHY (MODULE 1)
+// ----------------------------------------------------------------------------
+
+model Tenant {
+  id                        String             @id @default(cuid())
+  companyName               String
+  adminEmail                String             @unique
+  adminDesignation          String
+  adminContactNumber        String
+  declaredEmployeeCount     Int
+  countryRegion             String             @default("India")
+  operatingState            String             @default("Kerala") // Used for CGST+SGST vs IGST calculation
+  industryType              String
+  companyLogoUrl            String?
+
+  // Commercial Pricing & Billing State
+  planTier                  PlanTier
+  billingCycle              BillingCycle       @default(MONTHLY)
+  pricePerUserInr           Decimal            @db.Decimal(10, 2)
+  subscriptionStatus        SubscriptionStatus @default(PENDING_PAYMENT)
+  razorpayOrderId           String?
+  razorpayPaymentId         String?
+  stripeCustomerId          String?
+  stripeSubscriptionId      String?
+  isTeamSetupUnlocked       Boolean            @default(false)
+
+  // Configurable Operational Settings
+  travelRateTwoWheelerInr   Decimal            @default(6.00)  @db.Decimal(6, 2)
+  travelRateFourWheelerInr  Decimal            @default(10.00) @db.Decimal(6, 2)
+  zoneAutoProvisionHeadcount Int               @default(25)
+
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+
+  // Relations
+  zones                     Zone[]
+  users                     User[]
+  approvalRules             ApprovalMatrixRule[]
+  products                  Product[]
+  clients                   Client[]
+  deals                     Deal[]
+  salesTargets              SalesTarget[]
+  correctionRequests        ClientCorrectionRequest[]
+  auditLogs                 ImmutableAuditLog[]
+  paymentLogs               PlatformPaymentLog[]
+  supportTickets            SupportTicket[]
+
+  @@index([subscriptionStatus])
+}
+
+model Zone {
+  id           String        @id @default(cuid())
+  tenantId     String
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  zoneCode     ZoneCode      // Max 5 zones per tenant: NORTH, SOUTH, EAST, WEST, NORTHEAST
+  name         String
+  zoneHeadId   String?       @unique
+  zoneHead     User?         @relation("ZoneHeadAssignment", fields: [zoneHeadId], references: [id])
+
+  states       StateRegion[]
+  users        User[]        @relation("UserZone")
+  clients      Client[]
+
+  createdAt    DateTime      @default(now())
+
+  @@unique([tenantId, zoneCode])
+}
+
+model StateRegion {
+  id             String          @id @default(cuid())
+  tenantId       String
+  zoneId         String
+  zone           Zone            @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  stateName      String          // e.g., Kerala, Tamil Nadu, Karnataka
+  regionHeadId   String?
+
+  divisions      StateDivision[] // Minimum 4 divisions per state
+  users          User[]          @relation("UserStateRegion")
+  clients        Client[]
+
+  @@unique([zoneId, stateName])
+}
+
+model StateDivision {
+  id             String      @id @default(cuid())
+  tenantId       String
+  stateRegionId  String
+  stateRegion    StateRegion @relation(fields: [stateRegionId], references: [id], onDelete: Cascade)
+  divisionName   String      // Admin-named division (minimum 4 per state)
+  cityManagerId  String?
+
+  users          User[]      @relation("UserDivision")
+  clients        Client[]
+
+  @@unique([stateRegionId, divisionName])
+}
+
+// ----------------------------------------------------------------------------
+// 2. USERS, DYNAMIC LAYER DETECTION (DLD) & RESIGNATION FREEZE (MODULE 2 & 5)
+// ----------------------------------------------------------------------------
+
+model User {
+  id                        String         @id @default(cuid())
+  tenantId                  String
+  tenant                    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Employee Appointment Details (Section 6.1)
+  employeeCode              String         // Unique employee ID (e.g., EMP0234)
+  fullName                  String
+  email                     String         @unique
+  mobile                    String
+  designation               String
+  postalAddress             String?
+  aadharProofEncrypted      String?        // KMS/AES-256 encrypted reference
+  voterIdProofEncrypted     String?
+  photoUrl                  String?
+  baseSalaryInr             Decimal        @default(0) @db.Decimal(12, 2)
+  vehicleType               VehicleType    @default(FOUR_WHEELER)
+
+  // Auth & Invite State
+  passwordHash              String
+  mustResetPassword         Boolean        @default(true)
+  inviteExpiresAt           DateTime?
+  gpsConsentAcceptedAt      DateTime?      // DPDP Act 2023 Work-Hours GPS Consent
+
+  // Dynamic Layer Detection (DLD) Hierarchy Engine (Section 2.1)
+  department                DepartmentType
+  roleLevel                 RoleLevel
+  layerDepth                Int            @default(1) // 1 = Admin, 2 = Dept Head, 3 = Zone, 4 = Region, 5 = City, 6 = Exec, n = Subordinate
+  managerId                 String?
+  manager                   User?          @relation("UserHierarchy", fields: [managerId], references: [id])
+  subordinates              User[]         @relation("UserHierarchy")
+  materializedPath          String         @default("/") // Format: "/rootId/deptHeadId/zoneId/userId/" for O(1) chain-of-command queries
+
+  // Geographic Tagging
+  managedZone               Zone?          @relation("ZoneHeadAssignment")
+  zoneId                    String?
+  zone                      Zone?          @relation("UserZone", fields: [zoneId], references: [id])
+  stateRegionId             String?
+  stateRegion               StateRegion?   @relation("UserStateRegion", fields: [stateRegionId], references: [id])
+  divisionId                String?
+  division                  StateDivision? @relation("UserDivision", fields: [divisionId], references: [id])
+
+  // Resignation & Account Freeze Protocol (Section 6.6)
+  isResignationFrozen       Boolean        @default(false) // When true: ONLY Add Client & Follow-Up Remarks allowed; edits/deletes blocked
+  resignationSubmittedAt    DateTime?
+  noticePeriodEndDate       DateTime?
+  isLoginDisabled           Boolean        @default(false) // Auto-set to true at 23:59:59 on noticePeriodEndDate
+
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
+
+  // Relations
+  clientsCreated            Client[]                   @relation("ClientCreator")
+  dealsOwned                Deal[]                     @relation("DealOwner")
+  targetsReceived           SalesTarget[]              @relation("TargetAssignee")
+  targetsAssigned           SalesTarget[]              @relation("TargetAssigner")
+  discountRequestsMade      DiscountApprovalRequest[]  @relation("DiscountRequester")
+  discountApprovalsPending  DiscountApprovalRequest[]  @relation("DiscountCurrentApprover")
+  correctionRequestsMade    ClientCorrectionRequest[]  @relation("CorrectionRequester")
+  correctionReviewsDone     ClientCorrectionRequest[]  @relation("CorrectionAdminReviewer")
+  attendances               FieldAttendance[]
+  fieldVisits               FieldMeetingVisit[]
+  monthlyHrReports          MonthlyHrReport[]
+  leaveRequests             LeaveRequest[]             @relation("LeaveApplicant")
+  leaveApprovals            LeaveRequest[]             @relation("LeaveSeniorApprover")
+  resignationRecord         ResignationRecord?
+  auditLogs                 ImmutableAuditLog[]
+  supportTicketsCreated     SupportTicket[]            @relation("TenantTicketCreator")
+
+  @@unique([tenantId, employeeCode])
+  @@index([tenantId, managerId])
+  @@index([tenantId, materializedPath])
+  @@index([tenantId, department, layerDepth])
+}
+
+// ----------------------------------------------------------------------------
+// 3. PRODUCT MASTER, TARGETS & CLIENT MANAGEMENT (MODULE 3)
+// ----------------------------------------------------------------------------
+
+model Product {
+  id                  String         @id @default(cuid())
+  tenantId            String
+  tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  productCode         String         // e.g., PROD-A001, SERV-X001
+  name                String
+  unit                ProductUnit    @default(UNIT)
+  unitPriceInr        Decimal        @db.Decimal(12, 2)
+  hsnSacCode          String         // e.g., 84713000, 998311
+  gstRatePercent      Decimal        @default(18.00) @db.Decimal(5, 2)
+  description         String?
+  deliverables        String         // Auto-populated into Proposal PDF
+  termsAndConditions  String         // Auto-populated into Proposal PDF
+  isActive            Boolean        @default(true)
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  dealLineItems       DealLineItem[]
+
+  @@unique([tenantId, productCode])
+}
+
+model SalesTarget {
+  id               String       @id @default(cuid())
+  tenantId         String
+  tenant           Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  periodType       TargetPeriod // YEARLY, HALF_YEARLY, QUARTERLY
+  periodLabel      String       // e.g., "FY2026-27", "Q3-2026"
+  startDate        DateTime
+  endDate          DateTime
+
+  assignedById     String
+  assignedBy       User         @relation("TargetAssigner", fields: [assignedById], references: [id])
+  assignedToId     String
+  assignedTo       User         @relation("TargetAssignee", fields: [assignedToId], references: [id])
+
+  targetAmountInr  Decimal      @db.Decimal(14, 2)
+  achievedAmountInr Decimal     @default(0) @db.Decimal(14, 2)
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([tenantId, assignedToId, periodLabel])
+}
+
+model Client {
+  id                  String         @id @default(cuid())
+  tenantId            String
+  tenant              Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // Company Details (Section 3.2)
+  clientCode          String         // Auto-generated e.g. FOS240315
+  dateOfOpening       DateTime       @default(now())
+  companyName         String
+  address             String
+  zoneId              String
+  zone                Zone           @relation(fields: [zoneId], references: [id])
+  stateRegionId       String
+  stateRegion         StateRegion    @relation(fields: [stateRegionId], references: [id])
+  divisionId          String
+  division            StateDivision  @relation(fields: [divisionId], references: [id])
+  city                String
+  officeNumber        String?
+  gpsLat              Float?
+  gpsLng              Float?
+
+  // Primary Contact Person
+  contactName         String
+  contactDesignation  String
+  contactEmail        String
+  contactMobile       String
+
+  // Tax & Vendor KYC Info (Mandatory at Stage 6 Closure)
+  gstNumber           String?
+  panNumber           String?
+  cancelledChequeUrl  String?
+
+  // Pipeline & Activity Tracking
+  leadSource          LeadSource     @default(COLD_CALL)
+  natureOfCall        CallNature     @default(COLD)
+  currentStage        PipelineStage  @default(STAGE_1_LEAD_GEN)
+  statusLabel         String         @default("Introductory Email Sent") // e.g., "Introductory Email Sent", "Meeting Fixed", "Proposal stage"
+  nextFollowUpDate    DateTime?
+  latestRemarks       String?
+
+  // Section 13.1 Data Protection Protocol
+  createdById         String
+  createdBy           User           @relation("ClientCreator", fields: [createdById], references: [id])
+  isLocked            Boolean        @default(true) // Cannot be modified/deleted by managers without Admin approval
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  deals               Deal[]
+  fieldVisits         FieldMeetingVisit[]
+  correctionRequests  ClientCorrectionRequest[]
+
+  @@unique([tenantId, clientCode])
+  @@index([tenantId, createdById, currentStage])
+  @@index([tenantId, nextFollowUpDate])
+}
+
+model ClientCorrectionRequest {
+  id                   String               @id @default(cuid())
+  tenantId             String
+  tenant               Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId             String
+  client               Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  requestedById        String
+  requestedBy          User                 @relation("CorrectionRequester", fields: [requestedById], references: [id])
+  actionType           CorrectionActionType
+  originalValuesJson   Json                 // Snapshot of locked client fields
+  requestedValuesJson  Json                 // Proposed modifications
+  reason               String
+
+  status               CorrectionStatus     @default(PENDING_ADMIN)
+  reviewedByAdminId    String?
+  reviewedByAdmin      User?                @relation("CorrectionAdminReviewer", fields: [reviewedByAdminId], references: [id])
+  reviewedAt           DateTime?
+  adminNotes           String?
+
+  createdAt            DateTime             @default(now())
+
+  @@index([tenantId, status])
+}
+
+// ----------------------------------------------------------------------------
+// 4. 6-STAGE PIPELINE, PROPOSALS & DISCOUNT ESCALATION ENGINE (MODULE 3 & 4)
+// ----------------------------------------------------------------------------
+
+model ApprovalMatrixRule {
+  id                    String   @id @default(cuid())
+  tenantId              String
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  approvalLevelNumber   Int      // 5 = Executive, 4 = City Mgr, 3 = Region Mgr, 2 = Zone Head, 1 = Sales Head, 0 = Admin
+  roleLabel             String   // e.g., "Level 4 (City Manager)"
+  layerDepth            Int      // Maps to User.layerDepth
+  minDiscountPercent    Decimal  @db.Decimal(5, 2)
+  maxDiscountPercent    Decimal  @db.Decimal(5, 2)
+  maxDiscountAmountInr  Decimal  @db.Decimal(12, 2) // Dual-Gate Monetary Cap (Section 10.2)
+  slaHours              Int      // 0 (Instant), 4, 8, 12, 24, 48
+  escalateToLevelNumber Int?
+
+  @@unique([tenantId, approvalLevelNumber])
+}
+
+model Deal {
+  id                       String         @id @default(cuid())
+  tenantId                 String
+  tenant                   Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  dealCode                 String         // e.g., DEAL-2026-0001
+  clientId                 String
+  client                   Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  ownerId                  String
+  owner                    User           @relation("DealOwner", fields: [ownerId], references: [id])
+
+  stage                    PipelineStage  @default(STAGE_1_LEAD_GEN)
+  natureOfCall             CallNature     @default(COLD)
+  stageEnteredAt           DateTime       @default(now())
+
+  // Financials & Automated GST Calculation (Section 4.2 & 10.1)
+  subtotalInr              Decimal        @default(0) @db.Decimal(14, 2)
+  cgstInr                  Decimal        @default(0) @db.Decimal(14, 2)
+  sgstInr                  Decimal        @default(0) @db.Decimal(14, 2)
+  igstInr                  Decimal        @default(0) @db.Decimal(14, 2)
+  totalAmountInr           Decimal        @default(0) @db.Decimal(14, 2)
+
+  // Proposal Metadata
+  proposalPdfUrl           String?
+  proposalSentAt           DateTime?
+  proposalValidUntil       DateTime?      // Default +30 days from generation
+  nextFollowUpDate         DateTime?
+
+  // Stage 6 Commercial Handoff (Section 4.4)
+  isSaleConfirmed          Boolean        @default(false)
+  confirmedAt              DateTime?
+  requiredKycDocsList      String[]       // e.g., ["GST", "PAN", "Cancelled Cheque"]
+  handedOffToCommercial    Boolean        @default(false)
+
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @updatedAt
+
+  lineItems                DealLineItem[]
+  discountRequests         DiscountApprovalRequest[]
+
+  @@unique([tenantId, dealCode])
+  @@index([tenantId, ownerId, stage])
+  @@index([tenantId, handedOffToCommercial])
+}
+
+model DealLineItem {
+  id                   String                    @id @default(cuid())
+  dealId               String
+  deal                 Deal                      @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  productId            String
+  product              Product                   @relation(fields: [productId], references: [id])
+
+  quantity             Decimal                   @db.Decimal(12, 2)
+  actualUnitPriceInr   Decimal                   @db.Decimal(12, 2) // From Product Master
+  expectedClientRateInr Decimal?                 @db.Decimal(12, 2) // Client's requested rate
+  offeredUnitPriceInr  Decimal                   @db.Decimal(12, 2) // Salesperson/Approved rate
+  discountPercent      Decimal                   @default(0) @db.Decimal(5, 2)
+  gstRatePercent       Decimal                   @db.Decimal(5, 2)
+  lineSubtotalInr      Decimal                   @db.Decimal(14, 2)
+  lineTotalWithGstInr  Decimal                   @db.Decimal(14, 2)
+
+  discountRequests     DiscountApprovalRequest[]
+}
+
+model DiscountApprovalRequest {
+  id                    String         @id @default(cuid())
+  tenantId              String
+  dealId                String
+  deal                  Deal           @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  dealLineItemId        String
+  dealLineItem          DealLineItem   @relation(fields: [dealLineItemId], references: [id], onDelete: Cascade)
+
+  requestedById         String
+  requestedBy           User           @relation("DiscountRequester", fields: [requestedById], references: [id])
+  currentApproverId     String
+  currentApprover       User           @relation("DiscountCurrentApprover", fields: [currentApproverId], references: [id])
+  currentApprovalLevel  Int            // 4 (City), 3 (Region), 2 (Zone), 1 (Dept Head), 0 (Admin)
+
+  actualPriceInr        Decimal        @db.Decimal(12, 2)
+  expectedPriceInr      Decimal        @db.Decimal(12, 2)
+  offeredPriceInr       Decimal        @db.Decimal(12, 2)
+  discountPercent       Decimal        @db.Decimal(5, 2)
+  totalDiscountValueInr Decimal        @db.Decimal(14, 2)
+
+  status                ApprovalStatus @default(PENDING)
+  slaHoursAllocated     Int            // 4, 8, 12, 24, or 48
+  slaExpiresAt          DateTime       // Checked by background cron for auto-escalation
+  escalationHistoryJson Json           @default("[]") // Tracks timestamps of auto-escalations
+
+  // Hard Deny Tracking (Section 4.3: "Denied officer's level tracked on chart")
+  deniedByUserId        String?
+  deniedByLevel         Int?
+  decisionRemarks       String?
+  decidedAt             DateTime?
+
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  @@index([tenantId, status, slaExpiresAt])
+  @@index([currentApproverId, status])
+}
+
+// ----------------------------------------------------------------------------
+// 5. FIELD ATTENDANCE, GPS CHECK-IN, VOICE-TO-CRM & HR REPORTS (MODULE 5 & 6)
+// ----------------------------------------------------------------------------
+
+model FieldAttendance {
+  id                String   @id @default(cuid())
+  tenantId          String
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attendanceDate    DateTime @db.Date
+
+  signedInAt        DateTime @default(now())
+  signInLat         Float
+  signInLng         Float
+
+  signedOutAt       DateTime?
+  signOutLat        Float?
+  signOutLng        Float?
+  isGpsTrackingLive Boolean  @default(true) // Automatically set to false upon signOut (DPDP privacy rule)
+
+  @@unique([userId, attendanceDate])
+  @@index([tenantId, attendanceDate])
+}
+
+model FieldMeetingVisit {
+  id                        String    @id @default(cuid())
+  tenantId                  String
+  userId                    String
+  user                      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clientId                  String
+  client                    Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Step 1: Start Journey (Origin Point)
+  journeyStartedAt          DateTime  @default(now())
+  originLat                 Float
+  originLng                 Float
+
+  // Step 2: Check-In at Client Premises (Geo-Fence + Anti-Spoofing Verification)
+  checkedInAt               DateTime?
+  checkInLat                Float?
+  checkInLng                Float?
+  distanceFromClientMeters  Float?    // Must be <= 100m for geo-fence pass
+  isMockLocationPassed      Boolean   @default(true)
+  liveVerificationPhotoUrl  String?   // Live camera storefront/visiting-card photo
+
+  // Step 3: Check-Out & Road Distance Calculation
+  checkedOutAt              DateTime?
+  checkOutLat               Float?
+  checkOutLng               Float?
+  roadDistanceKm            Decimal   @default(0) @db.Decimal(8, 2) // Calculated via Maps Directions API
+  travelDurationMinutes     Int       @default(0)
+
+  // Module 6: Day-1 AI Differentiator (AI Voice-to-CRM Structured Extraction)
+  voiceNoteAudioUrl         String?
+  rawVoiceTranscript        String?
+  aiExtractedJson           Json?     // { remarks, expectedPriceInr, quantityRequired, nextFollowUpDate, natureOfCall }
+  meetingRemarks            String?
+
+  createdAt                 DateTime  @default(now())
+
+  @@index([tenantId, userId, journeyStartedAt])
+}
+
+model MonthlyHrReport {
+  id                    String   @id @default(cuid())
+  tenantId              String
+  userId                String
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  monthYear             String   // Format: "2026-03"
+
+  daysWorked            Int      @default(0)
+  leavesTaken           Int      @default(0)
+  totalFieldVisits      Int      @default(0)
+  totalTravelDistanceKm Decimal  @default(0) @db.Decimal(10, 2)
+  ratePerKmInr          Decimal  @default(10.00) @db.Decimal(6, 2)
+  travelAllowanceInr    Decimal  @default(0) @db.Decimal(12, 2) // totalTravelDistanceKm * ratePerKmInr
+  incentivesInr         Decimal  @default(0) @db.Decimal(12, 2)
+  netPayableInr         Decimal  @default(0) @db.Decimal(14, 2)
+
+  generatedAt           DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([userId, monthYear])
+  @@index([tenantId, monthYear])
+}
+
+model LeaveRequest {
+  id                 String      @id @default(cuid())
+  tenantId           String
+  applicantId        String
+  applicant          User        @relation("LeaveApplicant", fields: [applicantId], references: [id], onDelete: Cascade)
+
+  startDate          DateTime    @db.Date
+  endDate            DateTime    @db.Date
+  totalDays          Int
+  isEmergency        Boolean     @default(false)
+  reason             String
+
+  status             LeaveStatus @default(PENDING_SENIOR)
+  approverSeniorId   String
+  approverSenior     User        @relation("LeaveSeniorApprover", fields: [approverSeniorId], references: [id])
+  approvedAt         DateTime?
+  seniorRemarks      String?
+  isForwardedToHr    Boolean     @default(false)
+
+  createdAt          DateTime    @default(now())
+
+  @@index([tenantId, approverSeniorId, status])
+}
+
+model ResignationRecord {
+  id                       String   @id @default(cuid())
+  tenantId                 String
+  userId                   String   @unique
+  user                     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  reasonCategory           String
+  requestedEffectiveDate   DateTime @db.Date
+  willingToServeNotice     Boolean  @default(true)
+  additionalRemarks        String?
+
+  hrFixedLastWorkingDate   DateTime? @db.Date
+  accountFreezeActivatedAt DateTime  @default(now())
+  loginDisabledAt          DateTime?
+
+  createdAt                DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// 6. IMMUTABLE AUDIT LOG (SECTION 10.3 & 13.1 DATA INTEGRITY)
+// ----------------------------------------------------------------------------
+
+model ImmutableAuditLog {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorId       String
+  actor         User     @relation(fields: [actorId], references: [id])
+
+  entityType    String   // e.g., "Client", "Deal", "DiscountApprovalRequest", "User"
+  entityId      String
+  action        String   // e.g., "CREATE", "ADMIN_APPROVED_CORRECTION", "RESIGNATION_FREEZE_BLOCKED_ATTEMPT"
+  oldValueJson  Json?
+  newValueJson  Json?
+  previousHash  String?  // SHA-256 chain link for tamper-evidence
+  entryHash     String   // SHA-256(previousHash + actorId + entityId + oldValueJson + newValueJson + createdAt)
+
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// 7. LAYER 00 SAAS PLATFORM OWNER & CROSS-TENANT SUPPORT (MODULE 7 / PHASE 6)
+// ----------------------------------------------------------------------------
+
+enum SupportTicketCategory {
+  BILLING
+  BUG_REPORT
+  SETUP_HELP
+  FEATURE_REQUEST
+}
+
+enum SupportTicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_TENANT
+  RESOLVED
+  CLOSED
+}
+
+enum PaymentGatewayProvider {
+  RAZORPAY
+  STRIPE
+  MANUAL
+}
+
+enum PaymentLogStatus {
+  INITIATED
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+model SuperAdmin {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  fullName       String
+  passwordHash   String
+  isActive       Boolean   @default(true)
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model PlatformPaymentLog {
+  id               String                 @id @default(cuid())
+  tenantId         String
+  tenant           Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gatewayProvider  PaymentGatewayProvider @default(RAZORPAY)
+  gatewayOrderId   String
+  gatewayPaymentId String?
+  amountInr        Decimal                @db.Decimal(12, 2)
+  planTier         PlanTier
+  billingCycle     BillingCycle
+  employeeCount    Int
+  status           PaymentLogStatus       @default(INITIATED)
+  rawMetadataJson  Json?
+  createdAt        DateTime               @default(now())
+
+  @@index([tenantId])
+  @@index([gatewayOrderId])
+  @@index([status])
+}
+
+model SupportTicket {
+  id               String                 @id @default(cuid())
+  ticketNumber     String                 @unique // e.g. TKT-1001
+  tenantId         String
+  tenant           Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdById      String
+  createdBy        User                   @relation("TenantTicketCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  subject          String
+  category         SupportTicketCategory
+  priority         SupportTicketPriority  @default(MEDIUM)
+  status           SupportTicketStatus    @default(OPEN)
+  messages         SupportTicketMessage[]
+  resolvedAt       DateTime?
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  @@index([tenantId, status])
+}
+
+model SupportTicketMessage {
+  id               String         @id @default(cuid())
+  ticketId         String
+  ticket           SupportTicket  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderRole       String         // "TENANT_USER" | "SUPER_ADMIN"
+  senderName       String
+  message          String         @db.Text
+  createdAt        DateTime       @default(now())
+
+  @@index([ticketId])
+}
+
+// ----------------------------------------------------------------------------
+// 8. LAYER 00 PLATFORM BRANDING & UI THEME CONFIGURATION (MODULE 8 / PHASE 8)
+// ----------------------------------------------------------------------------
+
+model PlatformBrandingConfig {
+  id                   String   @id @default("default_platform_brand")
+  platformName         String   @default("KORBIT")
+  badgeText            String   @default("ABOS")
+  tagline              String   @default("The Autonomous Business Operating System")
+  supportEmail         String   @default("support@korbit.in")
+  footerCopyright      String   @default("© 2026 KORBIT ABOS Technologies. All rights reserved.")
+
+  // Visual Assets & SVG Vector Mode
+  useDynamicOrbitalSvg Boolean  @default(true)
+  logoLightUrl         String?  // Light background variant (Base64 data URI or CDN URL)
+  logoDarkUrl          String?  // Dark background variant
+  faviconUrl           String?
+
+  // Primary Theme Color Palette (Hex)
+  commandBgHex         String   @default("#0B1120")
+  primaryColorHex      String   @default("#2563EB")
+  accentColorHex       String   @default("#10B981")
+  surfaceBgHex         String   @default("#F8FAFC")
+
+  // Semantic Status Badges
+  coldBadgeHex         String   @default("#3B82F6")
+  warmBadgeHex         String   @default("#F59E0B")
+  hotBadgeHex          String   @default("#EF4444")
+
+  // Typography Options
+  headingFontFamily    String   @default("Plus Jakarta Sans")
+  monoFontFamily       String   @default("JetBrains Mono")
+
+  // Tenant Proposal Settings
+  allowTenantPdfLogo   Boolean  @default(true)
+  showPoweredByFooter  Boolean  @default(true)
+
+  updatedAt            DateTime @updatedAt
+  createdAt            DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// 9. MARKETING LEADS & GATED SIMULATION CAPTURE (MODULE 9 / PHASE 9)
+// ----------------------------------------------------------------------------
+
+enum MarketingLeadStatus {
+  NEW_LEAD
+  CONTACTED
+  DEMO_SCHEDULED
+  CONVERTED_TO_TENANT
+  ARCHIVED
+}
+
+model MarketingSimulationLead {
+  id                  String              @id @default(cuid())
+  businessEmail       String
+  organisationName    String
+  city                String
+  state               String
+  country             String              @default("India")
+  employeeCount       Int
+  recommendedTier     PlanTier
+  configuredIndustry  String
+  selectedModulesJson Json                @default("[]")
+  unlockedSimulator   Boolean             @default(true)
+  status              MarketingLeadStatus @default(NEW_LEAD)
+  superAdminNotes     String?             @db.Text
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@index([status])
+  @@index([businessEmail])
+  @@index([createdAt])
+}
+
+
