@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { escalateExpiredDiscountRequests } from "@/lib/discount-escalation";
+import { getSuperAdminFromCookie } from "@/lib/super-admin-auth";
+import { getTenantSessionFromCookie } from "@/lib/tenant-auth";
 
 /**
  * GET or POST /api/cron/escalate-discounts
@@ -13,13 +15,16 @@ export async function GET(req: NextRequest) {
     const authHeader = req.headers.get("authorization");
     const querySecret = searchParams.get("secret");
 
-    // Optional Production CRON_SECRET Guard
+    // Optional Production CRON_SECRET Guard: allow bearer token, query param, Vercel cron header, or authenticated Admin / Super Admin
     if (process.env.CRON_SECRET) {
       const isValidBearer = authHeader === `Bearer ${process.env.CRON_SECRET}`;
       const isValidQuery = querySecret === process.env.CRON_SECRET;
       const isVercelCron = Boolean(req.headers.get("x-vercel-cron"));
+      const superAdmin = await getSuperAdminFromCookie(req);
+      const tenantSession = await getTenantSessionFromCookie(req);
+      const isAuthorizedSession = Boolean(superAdmin || (tenantSession && tenantSession.layerDepth <= 2));
 
-      if (!isValidBearer && !isValidQuery && !isVercelCron) {
+      if (!isValidBearer && !isValidQuery && !isVercelCron && !isAuthorizedSession) {
         return NextResponse.json({ error: "Unauthorized cron execution" }, { status: 401 });
       }
     }

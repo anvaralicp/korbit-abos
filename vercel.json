@@ -1,9 +1,14 @@
 {
-  "framework": "nextjs",
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
     {
       "path": "/api/cron/escalate-discounts",
       "schedule": "*/15 * * * *"
     }
-  ]
+  ],
+  "functions": {
+    "src/app/api/**/*": {
+      "maxDuration": 30
+    }
+  }
 }
